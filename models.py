@@ -43,6 +43,7 @@ class RunState:
     intent: str = "unknown"            # "register" | "extract"
     supplier: Optional[str] = None
     required_supplier: Optional[str] = None   # resolved from the task, independent of the planner
+    requested_invoice_number: Optional[str] = None  # explicit invoice identifier, if present in the task
     require_latest: bool = False
     violations: int = 0
     plan: list = field(default_factory=list)

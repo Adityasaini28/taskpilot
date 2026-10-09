@@ -32,9 +32,14 @@ ONLY_RE = re.compile(r"\b(?:(?:only|just|simply)\s+(?:(?:want|need)\s+(?:you\s+)
                      r"(?:extract|tell|read|show|report|give|look|find|list|know|see|check|get|answer)"
                      r"|read[- ]?only|extract(?:ion)?[- ]only|information\s+only|no\s+writ\w*"
                      r"|without\s+(?:writ|sav|regist|record|enter)\w*)\b", re.I)
-NO_WRITE_RE = re.compile(r"\bno\s+(?:\w+\s+){0,2}(?:writ\w*|insert\w*|saves?|saving|records?|registration)\b", re.I)
 LATEST_RE = re.compile(r"\b(latest|newest|most recent|last)\b", re.I)
-NAME_RE = re.compile(r"\b(?:from|by|supplier|vendor)\s+((?:[A-Z][\w.'-]*)(?:\s+(?:&|[A-Z][\w.'-]*))*)")
+# Conservative phrase extraction for suppliers that are not in the local catalog.
+# Known catalog names are matched first, so this pattern does not override exact matches.
+SUPPLIER_CLAUSE_RE = re.compile(
+    r"\b(?:from|by|supplier|vendor|invoice\s+for)\s+(?:the\s+)?(.+?)"
+    r"(?=\s+(?:(?:in|into)\s+(?:the\s+)?(?:ap|accounts\s+payable)(?:\s+system)?\b"
+    r"|and\s+(?:tell|extract|enter|register|save|record|process|confirm|add|create)\b"
+    r"|then\b)|[,;.!?]|$)", re.I)
 
 
 class SafetyError(Exception):
@@ -78,10 +83,9 @@ def classify_task(task: str) -> TaskPolicy:
     if m:
         return TaskPolicy("unsupported", f"'{m.group(0)}' is outside this prototype's authorized capabilities "
                           "(it can only read invoices and create records in the local AP database).")
-    stripped = NO_WRITE_RE.sub(" ", NEG_RE.sub(" ", cleaned))   # drop negated write instructions
+    stripped = NEG_RE.sub(" ", cleaned)              # drop negated write instructions
     negated = stripped != cleaned
     read_only = bool(ONLY_RE.search(cleaned))
-    stripped = ONLY_RE.sub(" ", stripped)            # "read-only", "without saving" are not write requests
     affirmative = bool(WRITE_RE.search(stripped))
     if (negated or read_only) and affirmative:
         return TaskPolicy("ambiguous", clarification=(
@@ -100,20 +104,34 @@ class SupplierResolution:
 
 
 def resolve_supplier(task: str, known: list) -> SupplierResolution:
-    """Resolve the requested supplier from the user's task text alone (planner-independent)."""
+    """Resolve a supplier using the task text, independent of planner output.
+
+    Exact catalog names win. If no full name appears, a conservative supplier clause
+    is token-matched against the catalog; unknown names are reported instead of being
+    replaced with an arbitrary known supplier.
+    """
     nt = normalize_name(task)
-    named = sorted({n for n in known if normalize_name(n) in nt})
+    named = sorted({n for n in known if normalize_name(n) in nt}, key=lambda n: len(normalize_name(n)), reverse=True)
     if len(named) == 1:
         return SupplierResolution(named[0])
     if len(named) > 1:
+        # Two separately named catalog suppliers are ambiguous, not a license to choose one.
         return SupplierResolution(None, "ambiguous", tuple(named))
-    m = NAME_RE.search(task)
-    if not m:
+
+    match = SUPPLIER_CLAUSE_RE.search(task)
+    if not match:
         return SupplierResolution(None, "missing")
-    hits = sorted({n for n in known if supplier_matches(m.group(1), n)})
+    candidate = re.sub(r"^(?:the|company)\s+", "", match.group(1).strip().strip(" '").strip('"'), flags=re.I)
+    candidate = re.sub(r"\s+", " ", candidate).strip()
+    if not candidate or normalize_name(candidate) in {
+            "the latest invoice", "latest invoice", "the newest invoice", "newest invoice", "invoice", "it"}:
+        return SupplierResolution(None, "missing")
+    hits = sorted({n for n in known if supplier_matches(candidate, n)})
     if len(hits) == 1:
         return SupplierResolution(hits[0])
-    return SupplierResolution(None, "ambiguous" if hits else "unknown", tuple(hits))
+    if len(hits) > 1:
+        return SupplierResolution(None, "ambiguous", tuple(hits))
+    return SupplierResolution(None, "unknown", (candidate,))
 
 
 def sanitize_args(args: dict) -> dict:

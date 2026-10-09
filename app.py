@@ -103,8 +103,12 @@ with t_plan:
     if s:
         st.write("**Objectives**"); [st.write(f"- {p}") for p in s.plan]
         st.write("**Worker state**")
-        st.json({"intent": s.intent, "requested_supplier": s.required_supplier, "supplier": s.supplier, "selected_file": s.selected_file, "fields": s.fields,
-                 "record_id": (s.record or {}).get("id"), "tool_calls": s.tool_calls, "retries": s.retries,
+        st.json({"intent": s.intent, "requested_supplier": s.required_supplier,
+                 "requested_invoice_number": s.requested_invoice_number,
+                 "require_latest": s.require_latest, "supplier": s.supplier,
+                 "selected_file": s.selected_file, "fields": s.fields,
+                 "record_id": (s.record or {}).get("id"), "already_existed": s.already_existed,
+                 "objective_violations_blocked": s.violations, "tool_calls": s.tool_calls, "retries": s.retries,
                  "candidates": [f"{c['filename']} ({c['invoice_date']})" for c in s.candidates]})
 with t_ver:
     if s and s.verification:

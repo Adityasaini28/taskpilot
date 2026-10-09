@@ -51,7 +51,9 @@ class OfflinePlanner:
         if listing is None:
             return Step("list_invoice_documents", {}, "Discover available invoice documents")
         known = sorted({d["supplier"] for d in listing.data["documents"] if d.get("supplier")})
-        supplier = self._find_supplier(state.task, listing)
+        # The orchestrator is the source of truth for task constraints; do not
+        # independently re-parse the supplier differently in the offline planner.
+        supplier = state.required_supplier or self._find_supplier(state.task, listing)
         if not supplier:
             return self._ask("Which supplier do you mean? The request does not name one. Known suppliers: "
                              + ", ".join(known), ["supplier"])
@@ -65,7 +67,13 @@ class OfflinePlanner:
         if not dated:
             return self._ask(f"No readable invoice found for '{supplier}'. Known suppliers: " + ", ".join(known),
                              ["valid supplier name"])
-        target = dated[0]["filename"]       # tool sorts by parsed invoice date, newest first
+        if state.requested_invoice_number:
+            explicit = [m for m in dated if m.get("invoice_number", "").casefold() == state.requested_invoice_number.casefold()]
+            if not explicit:
+                return self._ask(f"Invoice {state.requested_invoice_number!r} was not found for '{supplier}'.", ["invoice number"])
+            target = explicit[0]["filename"]
+        else:
+            target = dated[0]["filename"]   # tool sorts by parsed invoice date, newest first
         ex = self._last(state, "extract_invoice_fields", target)
         if ex is None:
             return Step("extract_invoice_fields", {"filename": target}, "Newest invoice by invoice date; extract fields")

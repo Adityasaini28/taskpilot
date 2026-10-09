@@ -1,6 +1,6 @@
 # Submission Notes — TaskPilot
 
-**Summary:** Orchestrator (`agent.py`) + swappable planners + allowlisted tools + SQLite AP system. 32 pytest tests on real files/DB.
+**Summary:** Orchestrator (`agent.py`) + swappable planners + allowlisted tools + SQLite AP system. 29 pytest tests on real files/DB.
 
 ## Design decisions (and why)
 - **Small allowlisted toolset:** limits what a model (or injected text) can do; easy to validate and audit.
@@ -27,3 +27,12 @@ OpenAI Chat Completions with tools; `OPENAI_MODEL` default `gpt-4o-mini`; 30 s t
 
 ## Limitations
 Offline planner is rules, not reasoning. Text invoices only. No upload. Local single-user.
+
+
+## Final integrity fixes
+- Completion now compares the extracted source fields against the record held in agent state, independent verification result, and a fresh SQLite readback, including invoice number, invoice date, due date, amount, currency, and supplier.
+- A stale pre-existing record cannot satisfy a newer-invoice objective; guards reject mismatched invoice numbers and source files, and the low-level verification tool also checks its lookup arguments against the source file.
+- Writes require a successfully extracted source invoice and must target that same file.
+- Transient demo-failure injection is cleared on every run unless the current task is an authorized registration with the injection toggle enabled; resetting demo data also clears pending injection.
+
+- Explicit invoice numbers are enforced before source selection/writes; a conflicting request for an older invoice plus "latest" is clarified. If any matching invoice document lacks a parseable invoice date, the system does not guess which one is latest.

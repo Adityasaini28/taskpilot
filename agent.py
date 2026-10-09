@@ -2,6 +2,7 @@
 The orchestrator (not the planner) owns state, limits, retries, audit and final status."""
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import asdict
 from typing import Protocol
@@ -44,11 +45,14 @@ class Agent:
         s = RunState(run_id=uuid.uuid4().hex[:8], task=task.strip(), mode=self.planner.mode,
                      approved_tools=set(approved_tools or ()))
         self.registry.run_id = s.run_id
-        if inject_failure:
-            self.repo.arm_transient_failure(1)
         self._event(s, "goal", outcome={"task": s.task[:300], "mode": s.mode, "failure_injection": inject_failure})
         policy = classify_task(s.task)
         s.intent = policy.intent
+        # Inject only for an authorized write task. If no checkbox injection was
+        # requested, preserve explicitly armed repository failures used by tests.
+        # _end clears any unused injection before the next run can start.
+        if inject_failure:
+            self.repo.arm_transient_failure(1 if s.intent == "register" else 0)
         if policy.unsupported:
             return self._end(s, FAILED, f"Request declined: {policy.unsupported}", "unsupported_action")
         if policy.intent == "ambiguous":
@@ -99,36 +103,101 @@ class Agent:
                                              "known_suppliers": known})
         if res.supplier is None:
             reason = {"missing": "Which supplier do you mean? The request does not name one.",
-                      "unknown": "No known supplier matches the name given.",
+                      "unknown": f"No local invoice matches supplier '{res.candidates[0] if res.candidates else 'the name given'}'.",
                       "ambiguous": f"The request matches several suppliers ({', '.join(res.candidates)}). Which one?"}[res.problem]
             reason += " Known suppliers: " + ", ".join(known)
             s.human_request = {"needs_input": True, "reason": reason, "missing": ["supplier"]}
             return self._end(s, NEEDS_CLARIFICATION, reason, "clarification")
         s.required_supplier, s.require_latest = res.supplier, bool(LATEST_RE.search(s.task))
+        s.requested_invoice_number = _explicit_invoice_number(s.task)
+        candidates = self.registry.invoice_candidates(s.required_supplier)
+        if s.requested_invoice_number and not any(
+                m.get("invoice_number", "").casefold() == s.requested_invoice_number.casefold()
+                for m in candidates):
+            reason = (f"I could not find invoice {s.requested_invoice_number!r} for "
+                      f"{s.required_supplier!r}. No records were changed.")
+            s.human_request = {"needs_input": True, "reason": reason, "missing": ["valid invoice number"]}
+            return self._end(s, NEEDS_CLARIFICATION, reason, "invoice_not_found")
+        if s.require_latest:
+            latest = self.registry.latest_file(s.required_supplier)
+            if latest is None:
+                reason = (f"I cannot safely determine the latest invoice for {s.required_supplier!r} "
+                          "because at least one matching document has no valid invoice date. "
+                          "Please correct the invoice date or specify an invoice number.")
+                s.human_request = {"needs_input": True, "reason": reason,
+                                   "missing": ["valid invoice date or explicit invoice number"]}
+                return self._end(s, NEEDS_CLARIFICATION, reason, "latest_invoice_ambiguous")
+            latest_fields = self.registry.peek_fields(latest) or {}
+            if s.requested_invoice_number and latest_fields.get("invoice_number", "").casefold() != s.requested_invoice_number.casefold():
+                reason = (f"Your request names invoice {s.requested_invoice_number!r} but also asks for the latest invoice, "
+                          f"which is {latest_fields.get('invoice_number')!r}. Please clarify which invoice to use.")
+                s.human_request = {"needs_input": True, "reason": reason,
+                                   "missing": ["invoice selection"]}
+                return self._end(s, NEEDS_CLARIFICATION, reason, "conflicting_invoice_objective")
         return None
 
     def _guard(self, s: RunState, step: Step):
-        """Block any call that would leave the task objective (wrong supplier / write on a read-only task)."""
+        """Enforce the user's objective before every tool call, independent of planner behavior."""
         a = step.args if isinstance(step.args, dict) else {}
         req = s.required_supplier
 
         def block(kind: str, msg: str) -> ToolResult:
             return ToolResult(False, {"required_supplier": req}, kind, msg)
-        if step.tool == "create_ap_record" and s.intent != "register":
-            return block("intent_violation", "writes are not permitted: the request is read-only")
+
+        # Writes are only authorized for an unambiguous registration task.
+        if step.tool == "create_ap_record":
+            if s.intent != "register":
+                return block("intent_violation", "writes are not permitted: the request is read-only")
+            # Force the agent to inspect/validate the source before any side effect.
+            if not s.fields or not s.selected_file:
+                return block("objective_violation", "cannot write before extracting and validating the requested invoice")
+
         sup = a.get("supplier")
-        if step.tool in ("search_invoices", "get_ap_record", "verify_ap_record") and isinstance(sup, str) \
-                and not supplier_matches(req, sup):
-            return block("objective_violation", f"supplier '{sup[:60]}' is not the requested supplier '{req}'")
+        if step.tool in ("search_invoices", "get_ap_record", "verify_ap_record"):
+            if not isinstance(sup, str) or not supplier_matches(req or "", sup):
+                return block("objective_violation", f"supplier '{str(sup)[:60]}' is not the requested supplier '{req}'")
+            # Database keys should use the canonical supplier resolved from the user's task.
+            if step.tool in ("get_ap_record", "verify_ap_record") and normalize_name(sup) != normalize_name(req or ""):
+                return block("objective_violation", "AP lookup/verification must use the canonical requested supplier name")
+
+        # The invoice number is part of the objective, not a free planner choice.
+        if step.tool in ("get_ap_record", "verify_ap_record"):
+            requested_number = ((s.fields or {}).get("invoice_number")
+                                or s.requested_invoice_number)
+            if not requested_number and s.require_latest and req:
+                latest = self.registry.latest_file(req)
+                latest_fields = self.registry.peek_fields(latest) if latest else None
+                requested_number = (latest_fields or {}).get("invoice_number")
+            asked_number = a.get("invoice_number")
+            if requested_number and asked_number != requested_number:
+                return block("objective_violation", f"invoice '{asked_number}' is not the requested invoice '{requested_number}'")
+
         fn = a.get("filename")
-        if isinstance(fn, str) and step.tool in ("read_invoice_document", "extract_invoice_fields",
-                                                 "create_ap_record", "verify_ap_record"):
+        file_tools = ("read_invoice_document", "extract_invoice_fields", "create_ap_record", "verify_ap_record")
+        if isinstance(fn, str) and step.tool in file_tools:
             fields = self.registry.peek_fields(fn)
-            if fields is not None and normalize_name(fields.get("supplier", "")) != normalize_name(req):
+            if fields is not None and normalize_name(fields.get("supplier", "")) != normalize_name(req or ""):
                 return block("objective_violation", f"file '{fn[:60]}' is not an invoice from the requested supplier '{req}'")
-            if s.require_latest and step.tool in ("extract_invoice_fields", "create_ap_record") \
-                    and fn != self.registry.latest_file(req):
-                return block("objective_violation", f"'{fn[:60]}' is not the newest invoice (by invoice date) from '{req}'")
+            if (fields is not None and s.requested_invoice_number
+                    and fields.get("invoice_number", "").casefold() != s.requested_invoice_number.casefold()):
+                return block("objective_violation", f"file '{fn[:60]}' does not contain explicitly requested invoice {s.requested_invoice_number!r}")
+            if fields is not None and s.fields and step.tool in ("create_ap_record", "verify_ap_record"):
+                mismatches = _field_mismatches(s.fields, fields)
+                if mismatches:
+                    return block("objective_violation", "file does not match the invoice already extracted: " + "; ".join(mismatches))
+            if step.tool == "create_ap_record":
+                # A write must use precisely the source that was extracted and validated.
+                if fn != s.selected_file:
+                    return block("objective_violation", "write source differs from the extracted invoice")
+                mismatches = _field_mismatches(s.fields or {}, fields or {})
+                if mismatches:
+                    return block("objective_violation", "write source fields changed after extraction: " + "; ".join(mismatches))
+            if s.require_latest and step.tool in file_tools:
+                latest = self.registry.latest_file(req or "") if req else None
+                if latest is None:
+                    return block("objective_violation", f"cannot establish the latest invoice for '{req}' safely")
+                if fn != latest:
+                    return block("objective_violation", f"'{fn[:60]}' is not the newest invoice (by invoice date) from '{req}'")
         return None
 
     def _wrong_records(self, s: RunState):
@@ -139,23 +208,58 @@ class Agent:
         return None
 
     def _objective_failure(self, s: RunState):
-        """Independent end-of-run check that what was saved/extracted matches the original request."""
+        """Independently verify that the result matches the entire original objective and source invoice."""
         req = s.required_supplier
-        same = lambda a, b: bool(a) and bool(b) and normalize_name(a) == normalize_name(b)  # noqa: E731
+        if not req:
+            return "requested supplier was not resolved"
         wrong = self._wrong_records(s)
         if wrong:
             return wrong
-        src = (self.registry.peek_fields(s.selected_file) or {}).get("supplier") if s.selected_file else None
-        if not same(src, req):
+
+        if not s.selected_file:
+            return "no source invoice was selected"
+        source_fields = self.registry.peek_fields(s.selected_file)
+        if not source_fields:
+            return f"selected source file {s.selected_file!r} could not be independently parsed"
+        if normalize_name(source_fields.get("supplier", "")) != normalize_name(req):
             return f"selected source file {s.selected_file!r} is not an invoice from the requested supplier {req!r}"
+        field_mismatches = _field_mismatches(s.fields or {}, source_fields)
+        if field_mismatches:
+            return "extracted fields no longer match the selected source: " + "; ".join(field_mismatches)
+        if s.require_latest:
+            latest = self.registry.latest_file(req)
+            if latest is None or s.selected_file != latest:
+                return f"selected source {s.selected_file!r} is not verified as the latest invoice for {req!r}"
+
         if s.intent == "register":
-            rec, vrec = s.record or {}, (s.verification or {}).get("record") or {}
-            fresh = self.repo.get_by_id(rec["id"]) if rec.get("id") else None
-            if not (fresh and same(rec.get("supplier"), req) and same(vrec.get("supplier"), req)
-                    and same(fresh["supplier"], req) and vrec.get("id") == rec.get("id")):
-                return f"the saved/verified record does not match the requested supplier {req!r}"
-        elif not same((s.fields or {}).get("supplier"), req):
+            expected = s.fields or {}
+            rec = s.record or {}
+            v = s.verification or {}
+            vrec = v.get("record") or {}
+            rid = rec.get("id")
+            fresh = self.repo.get_by_id(rid) if rid is not None else None
+            if not v.get("passed"):
+                return "independent verification did not pass"
+            if not rid or not fresh:
+                return "the expected AP record does not exist in the database"
+            if vrec.get("id") != rid or fresh.get("id") != rid:
+                return "the saved record and independently verified record have different IDs"
+            for label, actual in (("agent record", rec), ("verification record", vrec), ("fresh database readback", fresh)):
+                mismatches = _field_mismatches(expected, actual)
+                if mismatches:
+                    return f"{label} does not match the requested source invoice: " + "; ".join(mismatches)
+                if normalize_name(actual.get("supplier", "")) != normalize_name(req):
+                    return f"{label} belongs to a different supplier than {req!r}"
+            # If the task named an invoice explicitly, a different invoice number must never satisfy it.
+            requested_number = _explicit_invoice_number(s.task)
+            if requested_number and expected.get("invoice_number", "").casefold() != requested_number.casefold():
+                return f"processed invoice {expected.get('invoice_number')!r} does not match explicitly requested invoice {requested_number!r}"
+        elif normalize_name((s.fields or {}).get("supplier", "")) != normalize_name(req):
             return f"extracted supplier does not match the requested supplier {req!r}"
+        else:
+            requested_number = _explicit_invoice_number(s.task)
+            if requested_number and (s.fields or {}).get("invoice_number", "").casefold() != requested_number.casefold():
+                return f"extracted invoice {s.fields.get('invoice_number')!r} does not match explicitly requested invoice {requested_number!r}"
         return None
 
     def _execute(self, s: RunState, step: Step) -> ToolResult:
@@ -238,11 +342,36 @@ class Agent:
         return self._end(s, FAILED, "Could not extract invoice details.", "no_result")
 
     def _end(self, s: RunState, status: str, message: str, error_type: str | None = None) -> RunState:
+        # Demo fault injection is scoped to one task run and must never leak forward.
+        self.repo.arm_transient_failure(0)
         s.status, s.error_type = status, error_type
         s.summary = message + _evidence_text(s)
         self._event(s, "final_status", outcome={"status": status, "message": message})
         self.repo.save_run(s.run_id, s.task, s.mode, status, s.summary)
         return s
+
+
+
+PERSISTED_FIELDS = ("supplier", "invoice_number", "invoice_date", "due_date", "amount_cents", "currency")
+
+
+def _field_mismatches(expected: dict, actual: dict) -> list[str]:
+    """Compare all fields that define invoice identity and persisted business values."""
+    if not expected or not actual:
+        return ["missing expected or actual invoice fields"]
+    return [f"{key}: expected {expected.get(key)!r}, got {actual.get(key)!r}"
+            for key in PERSISTED_FIELDS if expected.get(key) != actual.get(key)]
+
+
+def _explicit_invoice_number(task: str) -> str | None:
+    """Extract an explicit invoice identifier when users provide one in the task."""
+    patterns = (r"\binvoice\s*(?:number|no\.?|#|id)\s*[:#=-]?\s*([A-Z0-9][A-Z0-9-]{2,})\b",
+                r"\b(?:invoice|number)\s+([A-Z]{2,}[A-Z0-9-]*\d[A-Z0-9-]*)\b")
+    for pattern in patterns:
+        match = re.search(pattern, task, re.I)
+        if match:
+            return match.group(1).strip().rstrip(".,;")
+    return None
 
 
 def _brief(data: dict) -> dict:

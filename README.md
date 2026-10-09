@@ -14,18 +14,19 @@ All data is synthetic; nothing touches real accounts or payments.
 ## Features (all implemented)
 - 8 allowlisted, schema-validated tools (`tools.py`); no arbitrary code/SQL/paths
 - Real file reading, real SQLite writes, unique `(supplier, invoice_number)` constraint
-- Newest invoice chosen from **parsed invoice dates**, not filenames
+- Newest invoice chosen from **parsed invoice dates**, not filenames; if a matching file has no valid invoice date, the worker asks instead of guessing
+- Explicit invoice numbers are treated as task constraints; conflicts with a simultaneous "latest" request trigger clarification before planning/writing
 - Bounded loop: max 10 tool calls, max 2 retries on transient errors
 - Real failure injection inside the DB write path; retry produces exactly one record
 - Duplicate detection, clarification for missing/ambiguous/unknown supplier, refusal of payment/delete requests
-- Independent verification: record is re-read from SQLite and compared to the source file
+- Independent verification: source, extracted fields, stored record, verification readback, and the full task objective are compared; stale/older records cannot satisfy a latest-invoice request
 - Prompt-injection resistance: invoice text is data; parser only reads known `Label: value` lines; writes never take model-supplied values
 - Full audit trail in SQLite (`runs`, `audit_events`) and in the UI
 - Approval hook: `ToolSpec.requires_approval` → status "Awaiting approval" (no current tool uses it)
 
 ## Intent and objective guarantees
 - **Intent (`safety.classify_task`)**: explicit negation / read-only wording ("do NOT register", "don't save", "only extract", "just tell me", "without saving") beats generic write keywords. If a write instruction and a read-only instruction both remain, the result is `ambiguous` -> "Needs clarification", nothing is written. Read-only intent also blocks `create_ap_record` in the orchestrator, whatever the planner asks for.
-- **Task objective (`Agent._resolve_objective`, `_guard`, `_objective_failure`)**: before the planner runs, the requested supplier is resolved from the task text (missing/unknown/ambiguous -> clarification). Tool calls for another supplier's files/records, or (for "latest/newest" tasks) a non-newest invoice, are blocked and logged as `objective_violation`; search results are filtered to the requested supplier. A run is `Completed` only if verification passed **and** the saved record/selected file belong to the requested supplier.
+- **Task objective (`Agent._resolve_objective`, `_guard`, `_objective_failure`)**: before the planner runs, the requested supplier is resolved from the task text (missing/unknown/ambiguous -> clarification). Tool calls for another supplier's files/records, or (for "latest/newest" tasks) a non-newest invoice, are blocked and logged as `objective_violation`; search results are filtered to the requested supplier. A run is `Completed` only if verification passed **and** the saved record and selected source match the requested supplier, invoice identity, all persisted invoice fields, and latest-invoice constraint when requested.
 - Limitation: intent/supplier detection is keyword/token based, not semantic; unusual phrasing may produce a clarification request rather than an action (the safe direction).
 
 ## Architecture
@@ -77,8 +78,8 @@ Plain-text invoices with labelled lines; currency per invoice; supplier matching
 ## Known limitations
 - LLM mode has been tested only with a scripted fake client in the test suite, **not against the live OpenAI API** in this build.
 - Offline planner supports only this invoice workflow; no PDFs/OCR; no upload feature; no authentication.
-- Retries are performed by the orchestrator for any retryable tool error (the model does not choose them).
-- Supplier matching is token-based, not semantic.
+- Retries are performed by the orchestrator for any retryable tool error (the model does not choose them). Failure injection is cleared between runs and is only armed for authorized registration tasks.
+- Supplier matching is token-based, not semantic. Ambiguous/unknown mentions pause for clarification rather than guessing.
 
 ## Security
 No secrets in code; key from environment only and never logged (args are sanitized); filenames confined to the invoice folder; tool args validated; no raw SQL; invoice text treated as untrusted.

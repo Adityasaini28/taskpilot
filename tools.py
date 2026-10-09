@@ -106,13 +106,22 @@ class ToolRegistry:
         except SafetyError:
             return None
 
-    def latest_file(self, supplier: str):
-        """Newest dated invoice file for exactly this supplier (by invoice date)."""
+    def invoice_candidates(self, supplier: str) -> list[dict]:
+        """Invoice metadata for one canonical supplier, excluding fuzzy cross-supplier hits."""
         from invoice_parser import normalize_name
-        for m in self._search(supplier).data["matches"]:
-            if m["invoice_date"] and normalize_name(m["supplier"]) == normalize_name(supplier):
-                return m["filename"]
-        return None
+        result = self._search(supplier)
+        if not result.ok:
+            return []
+        return [m for m in result.data.get("matches", [])
+                if normalize_name(m.get("supplier", "")) == normalize_name(supplier)]
+
+    def latest_file(self, supplier: str):
+        """Newest invoice for an exact supplier, only when every candidate has a valid date."""
+        matches = self.invoice_candidates(supplier)
+        if not matches or any(not m.get("invoice_date") for m in matches):
+            # An undated matching document could be newer; do not silently choose an older one.
+            return None
+        return max(matches, key=lambda m: m["invoice_date"])["filename"]
 
     # ---- handlers ----
     def _parse_file(self, filename: str):
@@ -175,14 +184,24 @@ class ToolRegistry:
         return ToolResult(True, {"record": rec})
 
     def _verify(self, supplier: str, invoice_number: str, filename: str) -> ToolResult:
+        """Read a record back and verify the lookup arguments and all persisted invoice fields."""
         _, parsed = self._parse_file(filename)
+        expected = parsed.fields
+        mism = []
+        if not parsed.valid:
+            mism.append("source invoice is incomplete or invalid")
+        from invoice_parser import normalize_name
+        if normalize_name(expected.get("supplier", "")) != normalize_name(supplier):
+            mism.append(f"lookup supplier argument {supplier!r} does not match source supplier {expected.get('supplier')!r}")
+        if expected.get("invoice_number") != invoice_number:
+            mism.append(f"lookup invoice number {invoice_number!r} does not match source invoice {expected.get('invoice_number')!r}")
         rec = self.repo.get_by_key(supplier, invoice_number)
         if rec is None:
-            return ToolResult(True, {"passed": False, "mismatches": ["record not found in database"], "record": None})
-        expected = parsed.fields
-        mism = [f"{k}: expected {expected.get(k)!r}, database has {rec.get(k)!r}"
-                for k in ("supplier", "invoice_number", "invoice_date", "due_date", "amount_cents", "currency")
-                if expected.get(k) != rec.get(k)]
+            mism.append("record not found in database")
+            return ToolResult(True, {"passed": False, "mismatches": mism, "record": None, "checked_fields": 6})
+        for key in ("supplier", "invoice_number", "invoice_date", "due_date", "amount_cents", "currency"):
+            if expected.get(key) != rec.get(key):
+                mism.append(f"{key}: expected {expected.get(key)!r}, database has {rec.get(key)!r}")
         return ToolResult(True, {"passed": not mism, "mismatches": mism, "record": rec,
                                  "checked_fields": 6})
 

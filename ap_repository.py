@@ -152,6 +152,8 @@ class APRepository:
             return [dict(r) for r in c.execute("SELECT * FROM audit_events WHERE run_id=? ORDER BY id", (run_id,))]
 
     def reset(self) -> None:
+        """Clear demo tables and cancel any pending transient-failure injection."""
+        self._fail_next = 0
         with self._conn() as c:
             c.executescript("DELETE FROM ap_invoices; DELETE FROM runs; DELETE FROM audit_events;"
                             "DELETE FROM sqlite_sequence;")

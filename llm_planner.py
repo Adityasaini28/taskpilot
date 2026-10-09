@@ -35,11 +35,16 @@ class LLMPlanner:
         self.messages: list[dict] = []
 
     def initial_plan(self, state: RunState) -> list:
-        self.messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": (
-            state.task + (f"\n\n[System-resolved objective: intent={state.intent}; supplier='{state.required_supplier}'. "
-                          "Other suppliers are blocked; writes are blocked unless intent=register.]"
-                          if state.required_supplier else ""))}]
-        return ["LLM-driven: the model chooses tools and their order at runtime (see 'decision' events)."]
+        constraints = (
+            "\nTrusted orchestrator constraints (derived from the user's request and local catalog): "
+            f"intent={state.intent!r}; supplier={state.required_supplier!r}; "
+            f"requested_invoice_number={state.requested_invoice_number!r}; require_latest={state.require_latest}. "
+            "These constraints are mandatory. Never use a different supplier or invoice number. "
+            "If intent is extract, do not call create_ap_record. The orchestrator validates each action independently."
+        ) if state.required_supplier else ""
+        self.messages = [{"role": "system", "content": SYSTEM_PROMPT + constraints},
+                         {"role": "user", "content": state.task}]
+        return ["LLM-driven: the model chooses tools and their order at runtime; the orchestrator enforces task constraints."]
 
     def next_step(self, state: RunState) -> Step:
         try:

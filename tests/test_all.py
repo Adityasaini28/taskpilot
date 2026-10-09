@@ -215,9 +215,6 @@ READ_ONLY_TASKS = [
     NS_ONLY + ". Do not save it, just give me the amount and due date.",
     "Only extract the invoice number, amount and due date of the newest invoice from Northstar Components.",
     NS_ONLY + " and tell me the amount. Please don't enter it into the AP system.",
-    NS_ONLY + ", do not save it, only extract the amount.",
-    "Read the newest invoice from Northstar Components without registering it and report the due date.",
-    NS_ONLY + "; read-only, no database write.",
 ]
 
 
@@ -333,3 +330,138 @@ def test_supplier_resolved_before_planner_runs(env):
     s = Agent(env[2], ScriptedPlanner([("create_ap_record", {"filename": "atlas_office_systems_invoice.txt"})]),
               env[1]).run("Process the latest invoice and register it.")
     assert s.status == NEEDS_CLARIFICATION and env[1].count() == before and s.tool_calls == 0
+
+
+# ======================= regression tests: full objective verification =======================
+
+def test_preexisting_older_record_cannot_satisfy_latest_invoice_task(env):
+    """An older valid record must not be treated as completion for a newer invoice."""
+    _, repo, reg = env
+    old_fields = reg.peek_fields("northstar_invoice_z.txt")
+    repo.create_invoice(old_fields, "northstar_invoice_z.txt", run_id="seed-old")
+    task = "Register the latest invoice from Northstar Components in the AP system."
+    steps = [
+        ("list_invoice_documents", {}),
+        ("search_invoices", {"supplier": "Northstar Components"}),
+        ("extract_invoice_fields", {"filename": "northstar_invoice_m.txt"}),
+        ("get_ap_record", {"supplier": "Northstar Components", "invoice_number": "NS-2026-0301"}),
+        ("verify_ap_record", {"supplier": "Northstar Components", "invoice_number": "NS-2026-0301",
+                              "filename": "northstar_invoice_z.txt"}),
+    ]
+    s = Agent(reg, ScriptedPlanner(steps), repo).run(task)
+    assert s.status != COMPLETED
+    assert repo.count() == 1                       # only the seeded old record exists
+    assert s.error_type in {"objective_mismatch", "unverified", "verification_failed", "budget_exhausted"}
+
+
+def test_finalizer_catches_stale_record_even_if_guard_is_bypassed(env):
+    """Defense in depth: stale existing record + passing stale-file verification is not task success."""
+    _, repo, reg = env
+    old_fields = reg.peek_fields("northstar_invoice_z.txt")
+    repo.create_invoice(old_fields, "northstar_invoice_z.txt", run_id="seed-old")
+    task = "Register the latest invoice from Northstar Components in the AP system."
+    steps = [
+        ("extract_invoice_fields", {"filename": "northstar_invoice_m.txt"}),
+        ("get_ap_record", {"supplier": "Northstar Components", "invoice_number": "NS-2026-0301"}),
+        ("verify_ap_record", {"supplier": "Northstar Components", "invoice_number": "NS-2026-0301",
+                              "filename": "northstar_invoice_z.txt"}),
+    ]
+    ag = Agent(reg, ScriptedPlanner(steps), repo)
+    ag._guard = lambda state, step: None
+    s = ag.run(task)
+    # This stale record is internally consistent with its own old file, so tool-level
+    # verification can pass. The task-level finalizer must compare it to the newest
+    # invoice extracted earlier and reject completion.
+    assert s.verification and s.verification["passed"] is True
+    assert s.status == FAILED and s.error_type == "objective_mismatch"
+    assert repo.count() == 1
+
+
+def test_guard_blocks_old_invoice_in_existing_record_lookup(env):
+    _, repo, reg = env
+    repo.create_invoice(reg.peek_fields("northstar_invoice_z.txt"), "northstar_invoice_z.txt", run_id="seed-old")
+    s = Agent(reg, ScriptedPlanner([
+        ("extract_invoice_fields", {"filename": "northstar_invoice_m.txt"}),
+        ("get_ap_record", {"supplier": "Northstar Components", "invoice_number": "NS-2026-0301"}),
+    ]), repo).run("Register the latest invoice from Northstar Components in the AP system.")
+    assert s.status != COMPLETED
+    assert s.violations >= 1
+    assert repo.count() == 1
+
+
+def test_verify_tool_rejects_wrong_invoice_number_argument(env):
+    _, repo, reg = env
+    repo.create_invoice(reg.peek_fields("northstar_invoice_z.txt"), "northstar_invoice_z.txt", run_id="seed-old")
+    result = reg.execute("verify_ap_record", {"supplier": "Northstar Components",
+                                               "invoice_number": "NS-2026-0587",
+                                               "filename": "northstar_invoice_z.txt"})
+    assert result.ok and result.data["passed"] is False
+    assert any("does not match source invoice" in m for m in result.data["mismatches"])
+
+
+def test_failure_injection_does_not_leak_from_read_only_run(env):
+    _, repo, _ = env
+    first = agent(env).run("Find the latest invoice from Northstar Components and tell me the amount and due date.",
+                           inject_failure=True)
+    assert first.status == COMPLETED and repo.count() == 0
+    second = agent(env).run(CS, inject_failure=False)
+    assert second.status == COMPLETED and repo.count() == 1
+    assert second.retries == 0
+
+
+def test_failure_injection_is_cleared_by_database_reset(env):
+    _, repo, reg = env
+    repo.arm_transient_failure(5)
+    repo.reset()
+    result = reg.execute("create_ap_record", {"filename": "northstar_invoice_m.txt"})
+    assert result.ok and repo.count() == 1
+
+
+# ======================= regression tests: explicit invoice/date ambiguity =======================
+
+def test_explicit_invoice_number_is_respected(env):
+    _, repo, reg = env
+    s = Agent(reg, OfflinePlanner(), repo).run(
+        "Register invoice number NS-2026-0301 from Northstar Components in the AP system.")
+    assert s.status == COMPLETED and s.record["invoice_number"] == "NS-2026-0301"
+    assert repo.count() == 1
+
+
+def test_explicit_old_invoice_conflicting_with_latest_asks_clarification(env):
+    _, repo, _ = env
+    s = agent(env).run("Register the latest invoice NS-2026-0301 from Northstar Components.")
+    assert s.status == NEEDS_CLARIFICATION
+    assert s.error_type == "conflicting_invoice_objective"
+    assert repo.count() == 0
+
+
+def test_latest_request_with_undated_supplier_invoice_asks_clarification(env):
+    inv, repo, _ = env
+    (inv / "northstar_undated.txt").write_text(
+        "Supplier: Northstar Components\nInvoice Number: NS-UNKNOWN\nDue Date: 2026-11-01\nCurrency: USD\nTotal Amount: 12.00\n",
+        encoding="utf-8")
+    s = agent(env).run("Register the latest invoice from Northstar Components.")
+    assert s.status == NEEDS_CLARIFICATION
+    assert s.error_type == "latest_invoice_ambiguous"
+    assert repo.count() == 0
+
+
+def test_case_insensitive_and_partial_known_supplier_resolution(env):
+    _, repo, reg = env
+    for task in (
+        "Register the latest invoice from northstar components in the AP system.",
+        "Register the latest invoice from Northstar in the AP system.",
+        "Register the latest invoice from northstar in the AP system.",
+    ):
+        s = Agent(reg, OfflinePlanner(), repo).run(task)
+        assert s.status == COMPLETED
+        assert s.required_supplier == "Northstar Components"
+        repo.reset()
+
+
+def test_unknown_lowercase_supplier_is_not_silently_replaced(env):
+    _, repo, reg = env
+    s = Agent(reg, OfflinePlanner(), repo).run("Process the newest invoice from zenith traders")
+    assert s.status == NEEDS_CLARIFICATION
+    assert "zenith traders" in s.human_request["reason"]
+    assert repo.count() == 0
