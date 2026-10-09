@@ -1,0 +1,13 @@
+NORTHSTAR COMPONENTS
+INVOICE
+Supplier: Northstar Components
+Invoice Number: NS-2026-0587
+Invoice Date: 2026-09-22
+Due Date: 2026-10-22
+Currency: USD
+Line items:
+  Control modules x15 ... 16,250.00
+  Freight ... 2,492.50
+Subtotal: 18,742.50
+Total Amount: 18,742.50
+Payment Terms: Net 30

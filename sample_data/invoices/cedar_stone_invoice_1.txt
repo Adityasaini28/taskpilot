@@ -1,0 +1,10 @@
+CEDAR & STONE LOGISTICS
+Supplier: Cedar & Stone Logistics
+Invoice Number: CS-9102
+Invoice Date: 28 Sep 2026
+Due Date: 28 October 2026
+Currency: EUR
+Line items:
+  Pallet transport Rotterdam-Pune ... 7,310.40
+Total Amount: 7,310.40
+Payment Terms: Net 30

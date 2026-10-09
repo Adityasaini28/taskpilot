@@ -1,0 +1,12 @@
+NORTHSTAR COMPONENTS
+INVOICE
+Supplier: Northstar Components
+Invoice Number: NS-2026-0301
+Invoice Date: 2026-06-30
+Due Date: 2026-07-30
+Currency: USD
+Line items:
+  Precision bearings x200 ... 9,100.00
+Subtotal: 9,100.00
+Total Amount: 9,100.00
+Payment Terms: Net 30

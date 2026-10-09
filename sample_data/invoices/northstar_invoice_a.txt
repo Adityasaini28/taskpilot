@@ -1,0 +1,11 @@
+NORTHSTAR COMPONENTS
+INVOICE
+Supplier: Northstar Components
+Invoice Number: NS-2026-0412
+Invoice Date: 2026-08-14
+Due Date: 2026-09-13
+Currency: USD
+Line items:
+  Hydraulic valves x40 ... 12,380.00
+Total Amount: 12,380.00
+Payment Terms: Net 30

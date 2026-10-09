@@ -1,0 +1,8 @@
+CEDAR & STONE LOGISTICS
+Supplier: Cedar & Stone Logistics
+Invoice Number: CS-9031
+Invoice Date: 05 Sep 2026
+Due Date: 05 October 2026
+Currency: EUR
+Total Amount: 4,880.00
+Payment Terms: Net 30

@@ -1,0 +1,8 @@
+MERIDIAN SUPPLIES
+Supplier: Meridian Supplies
+Invoice Number: MS-5521
+Invoice Date: 2026-09-18
+Currency: USD
+Line items:
+  Safety gloves x500
+NOTE: total and due date were smudged on the scan.
